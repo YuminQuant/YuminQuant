@@ -27,7 +27,7 @@ class Alpha:
     """
 
     def __init__(self, factor, name, freq='W', layer=10, stock_pool='000985',
-                 st=True, up_down_limit=True, weight_limit=0.05, benchmark='mkt',
+                 st=True, up_down_limit=True, weight_limit=0.1, benchmark='mkt',
                  rolling_ic=True, plot='download',
                  return_type='vwap', data_path=r'D:\实习\研报复现\dataAll\stockDayData',
                  output_path=r'D:\实习\研报复现\QuantResearch\alpha_result', verbose=False):
@@ -70,11 +70,14 @@ class Alpha:
 
         self._ST_path = _os.path.join(data_path, 'pv\\st_dummy.pkl')
         self._upDownLimit_path = _os.path.join(data_path, 'pv\\upDownLimit.pkl')
+        self._mv_path = _os.path.join(data_path, f'pv\\stock_mv.pkl')
 
         self._dates_path = _os.path.join(data_path, f'calendar\\{self._freq}dates.pkl')
         self._Ddates_path = _os.path.join(data_path, f'calendar\\Ddates.pkl')
 
+        self._index_weight_path = _os.path.join(data_path, f'stockPool\\weight_{self._benchmark}.pkl')
         self._components_path = _os.path.join(data_path, f'stockPool\\stockPool_{self._stock_pool}.pkl')
+
         self._benchmark_path = _os.path.join(data_path, f'stockPool\\benchmark.pkl')
         self._barra_path = _os.path.join(data_path, f'Barra')
 
@@ -280,13 +283,14 @@ class Alpha:
 
         # 根据日期和股票代码将收益数据与因子数据合并
         self._factor = self._factor.join(_stock_return_daily, how='inner')
-        date = self._factor.index.get_level_values(0)
         # 计算每层的平均收益率
+        date = self._factor.index.get_level_values(0)
         grouped = self._factor.groupby([date, 'quantile'])
         self.group_return = grouped['returns'].mean().unstack()
+        self._factor['weight'] = 1 / grouped.transform('size')
+
         self.group_return.columns = ['G' + str(_) for _ in range(1, layer + 1)]
         self.group_return['factor_return'] = self._factor.groupby(level=0).apply(self._ls_rtn)
-        self._factor['weight'] = 1/grouped.transform('size')
 
         if self.ic > 0:
             query_top = f""" quantile=={self._layer - 1} """
@@ -302,17 +306,13 @@ class Alpha:
     def _excess_group(self):
         if self._verbose:
             print('开始计算分层超额...')
-        if self._benchmark == 'mkt':
-            if self._stock_pool == 'mkt' or self._stock_pool == '000985':
-                benchmark = _pd.read_pickle(self._return_path).mean(axis=1).loc[
-                            self.first_trading_day:self.last_trading_day]
-            else:
-                stock_pool = _pd.read_pickle(self._components_path)
-                benchmark = _pd.read_pickle(self._return_path).mul(stock_pool, axis=0).mean(axis=1).loc[
-                            self.first_trading_day:self.last_trading_day]
+        if self._benchmark == 'mkt' or self._benchmark == '000985':
+            benchmark = _pd.read_pickle(self._return_path).mean(axis=1).loc[
+                        self.first_trading_day:self.last_trading_day]
         else:
-            benchmark = _pd.read_pickle(self._benchmark_path)[self._benchmark] \
-                            .pct_change().loc[self.first_trading_day:self.last_trading_day]
+            stock_pool = _pd.read_pickle(self._index_weight_path)
+            benchmark = (_pd.read_pickle(self._return_path).mul(stock_pool, axis=0).dropna(axis=0, how='all').sum(axis=1)
+                         .loc[self.first_trading_day:self.last_trading_day])
         self.excess_group = self.group_return.sub(benchmark, axis=0).dropna(axis=0, how='all')
         self.excess_group.columns = [_ + '_excess' for _ in self.excess_group.columns]
 
@@ -385,7 +385,11 @@ class Alpha:
         fig, axes = _plt.subplots(6, 1, figsize=(8, 12))
 
         # 在第一个子图上画IC
-        bar_container = axes[0].bar(self.RankIC.index, self.RankIC, alpha=0.6, label='RankIC (left)', width=5)
+        if not self._rolling_ic:
+            bar_container = axes[0].bar(self.RankIC.index, self.RankIC, alpha=0.6, label='RankIC (left)', width=5)
+        else:
+            bar_container = axes[0].fill_between(self.RankIC.index, self.RankIC, alpha=0.8, zorder=1)
+
         axes2 = axes[0].twinx()
         line_container, = axes2.plot(self.RankIC.index, self.RankIC.cumsum(), label='Cummulative RankIC (right)',
                                      color=_r)
@@ -406,32 +410,33 @@ class Alpha:
             else:
                 axes[1].plot(cumulative_group.index, cumulative_group[column], color=color, alpha=0.8, zorder=1)
         axes[1].set_ylim(ymin=0)
-
         # 副轴画L-S
         ax_twin = axes[1].twinx()
         line, = ax_twin.plot(cumulative_group.index, cumulative_group['factor_return'],
                              label='FR', color='forestgreen', alpha=1)
-        # ax_twin.set_ylim(ymin=0)
 
-        left_ticks = axes[1].get_yticks()
+        left_ticks = axes[2].get_yticks()
         num_intervals = len(left_ticks) - 1
         right_ticks = _np.linspace(ax_twin.get_ybound()[0], ax_twin.get_ybound()[1], num_intervals + 1)
         ax_twin.set_yticks(right_ticks)
 
         lines.append(line)
-        labels.append('factor_return')
+        labels.append('factor_return (right)')
         ax_twin.grid(False)
 
-        # 显示图例，设置为3列，位置为上部中心
         axes[1].legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, 1.05), ncol=3,
                        fancybox=True, shadow=True)
 
         # 在第三个子图上绘制累计超额收益率曲线
         for i, (column, color) in enumerate(zip(cumulative_excess.columns, colors)):
             if i == 0 or i == len(cumulative_excess.columns) - 1:
-                axes[2].plot(cumulative_excess.index, cumulative_excess[column], label=column, color=color, zorder=3)
+                axes[2].plot(cumulative_excess.index, cumulative_excess[column], label=column, color=color,
+                             zorder=3)
+
             else:
                 axes[2].plot(cumulative_excess.index, cumulative_excess[column], color=color, alpha=0.8, zorder=1)
+
+        # 显示图例，设置为3列，位置为上部中心
         axes[2].legend(ncol=2, loc='upper center')
 
         # 头组尾组换手率
@@ -439,10 +444,12 @@ class Alpha:
         bottom_turnover = self.bottomGroupWeight.diff().abs().sum(axis=1)  #.replace(0, _np.nan).dropna()
         # ls_turnover = self.lsWeight.abs().diff().abs().sum(axis=1)#.replace(0, _np.nan).dropna()
 
-        axes[3].plot(bottom_turnover.index, bottom_turnover, color=colors[0], label='G1_turnover')
-        axes[3].plot(top_turnover.index, top_turnover, color=colors[-1], label=f'G{self._layer}_turnover')
+        axes[3].fill_between(bottom_turnover.index, bottom_turnover, where=(bottom_turnover >= 0),
+                             interpolate=True, color=colors[0], label='G1_turnover', alpha=0.8)
+        axes[3].fill_between(top_turnover.index, top_turnover, where=(top_turnover >= 0),
+                             interpolate=True, color=colors[-1], label=f'G{self._layer}_turnover', alpha=0.8)
         # axes[3].plot(ls_turnover.index, top_turnover, color='forestgreen', label=f'L-S_turnover', alpha=0.5)
-        # axes[3].legend(ncol=3, loc='upper center')
+        axes[3].legend(ncol=2, loc='upper center')
 
         # 分组柱状图
         return_group = self.group_return.groupby(_pd.Grouper(freq='Y')).sum().mean().iloc[:-1]
@@ -488,8 +495,8 @@ class Alpha:
 
             self.performance_panel('factor_return').to_excel(writer, sheet_name='LS_Performance')
             self.performance_panel(topGroupName).to_excel(writer, sheet_name='TopGroupPerformance')
-            data = pd.concat([self.group_return['factor_return'], self.excess_group[topGroupName],
-                              self.RankIC], axis=1)
+            data = _pd.concat([self.group_return['factor_return'], self.excess_group[topGroupName],
+                               self.RankIC], axis=1)
             data.to_excel(writer, sheet_name='DailySeries')
 
         if self._verbose:
@@ -609,7 +616,6 @@ def row_rolling_std(arr, window_size):
     return _np.nanstd(windowed_arr, axis=1, ddof=1)
 
 
-# 计算每一列的滚动标准差
 def row_rolling_mean(arr, window_size):
     # 计算每一列的滚动标准差
     # 首先，我们需要一个窗口视图
@@ -711,20 +717,23 @@ def winsor(self, row):
 def style_reg_neutral(fct, styles: list):
     fct_df = fct.copy()
     for style in styles:
-        if style == 'ind':
-            style_df = load_data("ind_citics").stack()
-            style_df = _pd.get_dummies(style_df, drop_first=True, dtype=int)
+        if style == 'SECTOR':
+            style_df = load_data("ind_citics")
         elif style == 'cap':
-            style_df = load_data("pv\\stock_mv").stack()
+            style_df = load_data("pv\\stock_mv")
         elif style in ['BETA', 'BTOP', 'EARNYILD', 'GROWTH', 'LEVERAGE',
                        'LIQUIDTY', 'MOMENTUM', 'RESVOL', 'SIZE', 'SIZENL']:
-            style_df = load_data(f'Barra\\{style}').stack()
+            style_df = load_data(f'Barra\\{style}')
         else:
             raise ValueError('Wrong Style')
 
         res = []
         for idx in _tqdm(fct_df.index):
-            temp = _pd.concat([fct_df.loc[idx], style_df.loc[idx]], axis=1).dropna()
+            if style == 'SECTOR':
+                sector_df = _pd.get_dummies(style_df.loc[idx], drop_first=True, dtype=int)
+                temp = _pd.concat([fct_df.loc[idx], sector_df], axis=1).dropna()
+            else:
+                temp = _pd.concat([fct_df.loc[idx], style_df.loc[idx]], axis=1).dropna()
 
             X = temp.iloc[:, 1:]
             X = _sm.add_constant(X)
